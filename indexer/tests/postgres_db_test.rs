@@ -68,6 +68,7 @@ fn make_db_transaction(sig: &str, txn_type: TransactionType) -> DbTransaction {
         remint_last_valid_block_heights: None,
         pending_remint_deadline_at: None,
         finality_check_attempts: 0,
+        recovery_requeue_attempts: 0,
     }
 }
 
@@ -334,8 +335,14 @@ async fn update_transaction_status_updates_fields() -> Result<(), Box<dyn std::e
     let txn = make_db_transaction("upd_status", TransactionType::Deposit);
     let id = storage.insert_db_transaction(&txn).await?;
 
+    // Production lifecycle: fetcher must flip to `processing` first.
+    sqlx::query("UPDATE transactions SET status = 'processing'::transaction_status WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await?;
+
     let now = Utc::now();
-    storage
+    let written = storage
         .update_transaction_status(
             id,
             TransactionStatus::Completed,
@@ -343,6 +350,10 @@ async fn update_transaction_status_updates_fields() -> Result<(), Box<dyn std::e
             now,
         )
         .await?;
+    assert!(
+        written,
+        "row was in Processing, terminal write should report Ok(true)"
+    );
 
     let row: (String, Option<String>) = sqlx::query_as(
         "SELECT status::text, counterpart_signature FROM transactions WHERE id = $1",
@@ -731,5 +742,217 @@ async fn get_mint_status_at_slot_returns_blocked_after_block_entry(
         .await?;
     let res = storage.get_mint_status_at_slot("mint_blk", 25).await?;
     assert_eq!(res, MintStatusAtSlot::Blocked);
+    Ok(())
+}
+
+// ── pending_release_signatures (verify-before-demote) ─────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn release_signature_insert_get_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+    let txn = make_db_transaction("rel_roundtrip", TransactionType::Withdrawal);
+    let id = storage.insert_db_transaction(&txn).await?;
+
+    storage
+        .insert_release_signature(id, "sig-a".to_string(), 100)
+        .await?;
+    storage
+        .insert_release_signature(id, "sig-b".to_string(), 200)
+        .await?;
+
+    let rows = storage.get_release_signatures(id).await?;
+    assert_eq!(
+        rows,
+        vec![("sig-a".to_string(), 100), ("sig-b".to_string(), 200)]
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn release_signature_insert_is_idempotent_on_signature(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+    let txn = make_db_transaction("rel_idem", TransactionType::Withdrawal);
+    let id = storage.insert_db_transaction(&txn).await?;
+
+    storage
+        .insert_release_signature(id, "dup-sig".to_string(), 100)
+        .await?;
+    // Same signature again is a no-op (ON CONFLICT DO NOTHING).
+    storage
+        .insert_release_signature(id, "dup-sig".to_string(), 999)
+        .await?;
+
+    let rows = storage.get_release_signatures(id).await?;
+    assert_eq!(rows.len(), 1, "duplicate signature must not double-insert");
+    assert_eq!(rows[0], ("dup-sig".to_string(), 100), "first write wins");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn release_signature_delete_removes_all_for_txn() -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+    let txn = make_db_transaction("rel_delete", TransactionType::Withdrawal);
+    let id = storage.insert_db_transaction(&txn).await?;
+
+    storage
+        .insert_release_signature(id, "sig-x".to_string(), 1)
+        .await?;
+    storage
+        .insert_release_signature(id, "sig-y".to_string(), 2)
+        .await?;
+    storage.delete_release_signatures(id).await?;
+    assert!(storage.get_release_signatures(id).await?.is_empty());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn release_signature_gc_only_drops_non_processing() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (pool, storage, _pg) = start_postgres().await?;
+
+    let proc_txn = make_db_transaction("rel_gc_proc", TransactionType::Withdrawal);
+    let proc_id = storage.insert_db_transaction(&proc_txn).await?;
+    let done_txn = make_db_transaction("rel_gc_done", TransactionType::Withdrawal);
+    let done_id = storage.insert_db_transaction(&done_txn).await?;
+
+    sqlx::query("UPDATE transactions SET status = 'processing'::transaction_status WHERE id = $1")
+        .bind(proc_id)
+        .execute(&pool)
+        .await?;
+    sqlx::query("UPDATE transactions SET status = 'completed'::transaction_status WHERE id = $1")
+        .bind(done_id)
+        .execute(&pool)
+        .await?;
+
+    storage
+        .insert_release_signature(proc_id, "sig-proc".to_string(), 1)
+        .await?;
+    storage
+        .insert_release_signature(done_id, "sig-done".to_string(), 2)
+        .await?;
+
+    let removed = storage.gc_stale_release_signatures().await?;
+    assert_eq!(
+        removed, 1,
+        "GC must drop exactly the non-processing row's sig"
+    );
+    assert_eq!(storage.get_release_signatures(proc_id).await?.len(), 1);
+    assert!(storage.get_release_signatures(done_id).await?.is_empty());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn release_signature_cascade_on_transaction_delete() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (pool, storage, _pg) = start_postgres().await?;
+    let txn = make_db_transaction("rel_cascade", TransactionType::Withdrawal);
+    let id = storage.insert_db_transaction(&txn).await?;
+    storage
+        .insert_release_signature(id, "sig-cascade".to_string(), 1)
+        .await?;
+
+    sqlx::query("DELETE FROM transactions WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await?;
+
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pending_release_signatures WHERE transaction_id = $1",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(count, 0, "ON DELETE CASCADE must remove orphaned sigs");
+    Ok(())
+}
+
+// ── recovery requeue counter ─────────────────────────────────────────────────
+
+async fn status_of(pool: &PgPool, id: i64) -> String {
+    sqlx::query_scalar::<_, String>("SELECT status::text FROM transactions WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn updated_at_of(pool: &PgPool, id: i64) -> chrono::DateTime<Utc> {
+    sqlx::query_scalar("SELECT updated_at FROM transactions WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn requeue_attempts_of(pool: &PgPool, id: i64) -> i32 {
+    sqlx::query_scalar("SELECT recovery_requeue_attempts FROM transactions WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn try_requeue_processing_increments_recovery_counter(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let txn = make_db_transaction("requeue_counter", TransactionType::Deposit);
+    let id = storage.insert_db_transaction(&txn).await?;
+    // Lock flips Pending → Processing (and bumps updated_at via trigger).
+    storage
+        .get_and_lock_pending_transactions(TransactionType::Deposit, 100)
+        .await?;
+    assert_eq!(
+        requeue_attempts_of(&pool, id).await,
+        0,
+        "starts at default 0"
+    );
+
+    let captured = updated_at_of(&pool, id).await;
+    let requeued = storage.try_requeue_processing(id, captured).await?;
+    assert!(
+        requeued,
+        "CAS requeue must succeed for the captured timestamp"
+    );
+
+    assert_eq!(
+        status_of(&pool, id).await,
+        "pending",
+        "requeue must demote back to pending"
+    );
+    assert_eq!(
+        requeue_attempts_of(&pool, id).await,
+        1,
+        "successful requeue must increment the durable counter by exactly 1"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn try_requeue_processing_stale_cas_leaves_counter_unchanged(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let txn = make_db_transaction("requeue_stale", TransactionType::Deposit);
+    let id = storage.insert_db_transaction(&txn).await?;
+    storage
+        .get_and_lock_pending_transactions(TransactionType::Deposit, 100)
+        .await?;
+
+    // A timestamp that does NOT match the row's updated_at → CAS no-op.
+    let stale = updated_at_of(&pool, id).await - chrono::Duration::seconds(60);
+    let requeued = storage.try_requeue_processing(id, stale).await?;
+    assert!(!requeued, "stale CAS must no-op");
+
+    assert_eq!(
+        status_of(&pool, id).await,
+        "processing",
+        "no-op CAS must leave status untouched"
+    );
+    assert_eq!(
+        requeue_attempts_of(&pool, id).await,
+        0,
+        "no-op CAS must NOT bump the counter"
+    );
     Ok(())
 }

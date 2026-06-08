@@ -3,7 +3,9 @@ pub use super::models::*;
 pub mod bump_pending_remint_finality_attempt;
 pub mod close;
 pub mod count_pending_transactions;
+pub mod delete_release_signatures;
 pub mod drop_tables;
+pub mod gc_stale_release_signatures;
 pub mod get_all_db_transactions;
 pub mod get_and_lock_pending_transactions;
 pub mod get_committed_checkpoint;
@@ -15,13 +17,19 @@ pub mod get_mint_status_at_slot;
 pub mod get_orphan_deposit_ids;
 pub mod get_pending_db_transactions;
 pub mod get_pending_remint_transactions;
+pub mod get_release_signatures;
+pub mod get_stale_processing_transactions;
 pub mod init_schema;
 pub mod insert_db_transaction;
 pub mod insert_db_transactions_batch;
 pub mod insert_mint_statuses_batch;
+pub mod insert_release_signature;
 pub mod quarantine_all_active_withdrawals;
 pub mod set_mint_extension_flags;
 pub mod set_pending_remint;
+pub mod try_complete_processing;
+pub mod try_quarantine_processing;
+pub mod try_requeue_processing;
 pub mod update_committed_checkpoint;
 pub mod update_transaction_status;
 pub mod upsert_mints_batch;
@@ -120,14 +128,14 @@ impl Storage {
         update_committed_checkpoint::update_committed_checkpoint(self, program_type, slot).await
     }
 
-    /// Update transaction status after processing
+    /// Terminal status write; `Ok(false)` if row already off Processing.
     pub async fn update_transaction_status(
         &self,
         transaction_id: i64,
         status: TransactionStatus,
         counterpart_signature: Option<String>,
         processed_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), StorageError> {
+    ) -> Result<bool, StorageError> {
         update_transaction_status::update_transaction_status(
             self,
             transaction_id,
@@ -294,6 +302,92 @@ impl Storage {
     ) -> Result<u64, StorageError> {
         quarantine_all_active_withdrawals::quarantine_all_active_withdrawals(self, exclude_id).await
     }
+
+    /// Stale `Processing` rows past the threshold (used by recovery).
+    pub async fn get_stale_processing_transactions(
+        &self,
+        threshold: std::time::Duration,
+        limit: i64,
+    ) -> Result<Vec<DbTransaction>, StorageError> {
+        get_stale_processing_transactions::get_stale_processing_transactions(self, threshold, limit)
+            .await
+    }
+
+    /// CAS `Processing` → `Pending` on `updated_at`; `Ok(false)` if stale.
+    pub async fn try_requeue_processing(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, StorageError> {
+        try_requeue_processing::try_requeue_processing(self, transaction_id, expected_updated_at)
+            .await
+    }
+
+    /// CAS `Processing` → `Completed` on `updated_at`; `Ok(false)` if stale.
+    pub async fn try_complete_processing(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
+        counterpart_signature: Option<String>,
+    ) -> Result<bool, StorageError> {
+        try_complete_processing::try_complete_processing(
+            self,
+            transaction_id,
+            expected_updated_at,
+            counterpart_signature,
+        )
+        .await
+    }
+
+    /// CAS `Processing` → `ManualReview`; reason rides on the webhook, not DB.
+    pub async fn try_quarantine_processing(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, StorageError> {
+        try_quarantine_processing::try_quarantine_processing(
+            self,
+            transaction_id,
+            expected_updated_at,
+        )
+        .await
+    }
+
+    /// Record a broadcast release signature so recovery can verify finality
+    /// before demoting. Idempotent on `signature`.
+    pub async fn insert_release_signature(
+        &self,
+        transaction_id: i64,
+        signature: String,
+        last_valid_block_height: i64,
+    ) -> Result<(), StorageError> {
+        insert_release_signature::insert_release_signature(
+            self,
+            transaction_id,
+            signature,
+            last_valid_block_height,
+        )
+        .await
+    }
+
+    /// Stored release signatures for a transaction as (signature, lvbh).
+    pub async fn get_release_signatures(
+        &self,
+        transaction_id: i64,
+    ) -> Result<Vec<(String, i64)>, StorageError> {
+        get_release_signatures::get_release_signatures(self, transaction_id).await
+    }
+
+    /// Delete all stored release signatures for a transaction.
+    pub async fn delete_release_signatures(&self, transaction_id: i64) -> Result<(), StorageError> {
+        delete_release_signatures::delete_release_signatures(self, transaction_id).await
+    }
+
+    /// Drop release signatures whose parent transaction is no longer
+    /// `Processing`. Returns the number of rows removed.
+    pub async fn gc_stale_release_signatures(&self) -> Result<u64, StorageError> {
+        gc_stale_release_signatures::gc_stale_release_signatures(self).await
+    }
 }
 
 /// MockStorage behavior tests — only test non-trivial mock logic (filtering, recording, failure).
@@ -335,6 +429,7 @@ mod tests {
             remint_last_valid_block_heights: None,
             pending_remint_deadline_at: None,
             finality_check_attempts: 0,
+            recovery_requeue_attempts: 0,
         }
     }
 
@@ -1053,9 +1148,10 @@ mod tests {
             processed_at: None,
             counterpart_signature: None,
             remint_signatures: None,
-            pending_remint_deadline_at: None,
             remint_last_valid_block_heights: None,
+            pending_remint_deadline_at: None,
             finality_check_attempts: 0,
+            recovery_requeue_attempts: 0,
         });
     }
 

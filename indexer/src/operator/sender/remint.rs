@@ -8,12 +8,12 @@ use crate::{
         sender::{
             find_existing_mint_signature_with_memo,
             transaction::FINALITY_SAFETY_DELAY,
-            types::{InstructionWithSigners, PendingRemint},
+            types::{InstructionWithSigners, PendingRemint, PendingSig},
         },
         sign_and_send_transaction,
         utils::instruction_util::WithdrawalRemintInfo,
         ConfirmationResult, ExtraErrorCheckPolicy, MintToBuilder, MintToBuilderWithTxnId,
-        RetryPolicy, SignerUtil, TransactionStatusUpdate,
+        RetryPolicy, RpcClientWithRetry, SignerUtil, TransactionStatusUpdate,
     },
     storage::TransactionStatus,
 };
@@ -180,6 +180,96 @@ pub async fn execute_deferred_remint(
     }
 }
 
+/// On-chain finality verdict for a set of broadcast release signatures. Shared
+/// by the remint gate and recovery so both agree before mutating a withdrawal.
+pub(crate) enum SigFinality {
+    /// A signature finalized successfully — the release landed.
+    Landed(Signature),
+    /// A signature could still land; carries a reason for triage logs.
+    Live(String),
+    /// Every signature is finalized-failed or expired — safe to remint/demote.
+    Dead,
+    /// Could not classify (RPC/length error); callers must NOT treat as Dead.
+    Uncertain(String),
+}
+
+/// Classify `sigs` against on-chain state (see `SigFinality` variants).
+pub(crate) async fn classify_release_signatures(
+    rpc: &RpcClientWithRetry,
+    sigs: &[PendingSig],
+) -> SigFinality {
+    let flat: Vec<Signature> = sigs.iter().map(|p| p.signature).collect();
+
+    let response = match rpc.get_signature_statuses_with_history(&flat).await {
+        Ok(r) => r,
+        Err(e) => {
+            return SigFinality::Uncertain(format!("signature status RPC failed: {}", e));
+        }
+    };
+
+    // RPC returns one status per signature in order; a length mismatch would
+    // silently skip checks below, so treat it as uncertain.
+    if response.value.len() != flat.len() {
+        return SigFinality::Uncertain(format!(
+            "RPC returned {} statuses for {} signatures",
+            response.value.len(),
+            flat.len()
+        ));
+    }
+
+    // Any sig finalized successfully → the release landed.
+    let finalized_success_index = response.value.iter().position(|signature_status| {
+        signature_status.as_ref().is_some_and(|status| {
+            status.satisfies_commitment(CommitmentConfig::finalized()) && status.err.is_none()
+        })
+    });
+    if let Some(index) = finalized_success_index {
+        return SigFinality::Landed(flat[index]);
+    }
+
+    // Fetch block height only for the lvbh check on null-status sigs, so a
+    // transient getBlockHeight outage isn't treated as uncertainty otherwise.
+    let current_height = if response.value.iter().any(|s| s.is_none()) {
+        match rpc.get_block_height().await {
+            Ok(h) => h,
+            Err(e) => {
+                return SigFinality::Uncertain(format!("block height RPC failed: {}", e));
+            }
+        }
+    } else {
+        // Unused: the null-status branch below only fires when some status is None.
+        0
+    };
+
+    // Walk the sigs to see if any could still land (index-aligned with response.value).
+    for (index, pending_sig) in sigs.iter().enumerate() {
+        let signature_status = &response.value[index];
+
+        if let Some(status) = signature_status.as_ref() {
+            // Only `finalized` is definitive; success was handled above, so this is failure.
+            if status.satisfies_commitment(CommitmentConfig::finalized()) {
+                continue;
+            }
+            // confirmed/processed: in a block, will finalize regardless of blockhash validity.
+            return SigFinality::Live(
+                "signature is on-chain (confirmed/processed) and awaiting finalization".to_string(),
+            );
+        }
+
+        // No status entry. lvbh is the only thing keeping it alive.
+        if current_height > pending_sig.last_valid_block_height {
+            continue;
+        }
+        return SigFinality::Live(format!(
+            "signatures still within blockhash validity (current_height={})",
+            current_height
+        ));
+    }
+
+    // Every sig is finalized-failed or expired.
+    SigFinality::Dead
+}
+
 /// Process matured entries in the deferred remint queue. For each matured
 /// entry, classify the stored withdrawal signatures and pick one of:
 ///   1. Any sig finalized + success → report Completed.
@@ -216,149 +306,33 @@ pub async fn process_pending_remints(
             .map(|n| n.to_string())
             .unwrap_or_else(|| "none".to_string());
 
-        // Flatten to a plain Signature slice for the RPC call.
-        let sigs: Vec<Signature> = entry
-            .signatures
-            .iter()
-            .map(|pending_sig| pending_sig.signature)
-            .collect();
-
-        // Ask for the status of every stored signature in one shot.
-        let response = match state
-            .rpc_client
-            .get_signature_statuses_with_history(&sigs)
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                // Couldn't classify. Bump counter and retry next tick, or ManualReview at cap.
+        // Classify the stored signatures against on-chain state.
+        match classify_release_signatures(&state.rpc_client, &entry.signatures).await {
+            // Case 1: a sig finalized successfully — the withdrawal landed.
+            SigFinality::Landed(sig) => {
+                send_completed(storage_tx, &entry, &nonce_label, sig).await;
+            }
+            // Case 2: could still land or unclassifiable → defer, don't remint.
+            SigFinality::Live(reason) | SigFinality::Uncertain(reason) => {
                 defer_or_escalate(
                     &mut remaining,
                     entry,
                     &nonce_label,
-                    &format!("signature status RPC failed: {}", e),
+                    &reason,
                     &state.storage,
                     storage_tx,
                 )
                 .await;
-                continue;
             }
-        };
-
-        // The Solana RPC contract returns one status per input signature in
-        // the same order. If that's violated we'd silently skip checks below.
-        // Treat a length mismatch as a classification failure and defer.
-        if response.value.len() != sigs.len() {
-            defer_or_escalate(
-                &mut remaining,
-                entry,
-                &nonce_label,
-                &format!(
-                    "RPC returned {} statuses for {} signatures",
-                    response.value.len(),
-                    sigs.len()
-                ),
-                &state.storage,
-                storage_tx,
-            )
-            .await;
-            continue;
-        }
-
-        // Case 1: if any sig finalized successfully, the withdrawal landed.
-        // Mark Completed and drop the entry.
-        let finalized_success_index = response.value.iter().position(|signature_status| {
-            signature_status.as_ref().is_some_and(|status| {
-                status.satisfies_commitment(CommitmentConfig::finalized()) && status.err.is_none()
-            })
-        });
-        if let Some(index) = finalized_success_index {
-            send_completed(storage_tx, &entry, &nonce_label, sigs[index]).await;
-            continue;
-        }
-
-        // Block height is only needed for the lvbh check on null-status sigs.
-        // If every sig has a status, the liveness decision is already implied
-        // and we skip the RPC; a transient getBlockHeight outage shouldn't
-        // burn defer attempts when no sig actually needs the height.
-        let current_height = if response.value.iter().any(|s| s.is_none()) {
-            match state.rpc_client.get_block_height().await {
-                Ok(h) => h,
-                Err(e) => {
-                    defer_or_escalate(
-                        &mut remaining,
-                        entry,
-                        &nonce_label,
-                        &format!("block height RPC failed: {}", e),
-                        &state.storage,
-                        storage_tx,
-                    )
-                    .await;
-                    continue;
-                }
-            }
-        } else {
-            // Unreachable below: the null-status branch only fires when at
-            // least one status is None, which we just ruled out.
-            0
-        };
-
-        // Walk the sigs to see if any could still land. Exit early on the
-        // first one that isn't dead. Index-aligned with response.value
-        // (length equality enforced above). Captures a reason describing
-        // why the broadcast could still land so the defer/ManualReview
-        // message can guide operator triage.
-        let mut live_reason: Option<String> = None;
-        for (index, pending_sig) in entry.signatures.iter().enumerate() {
-            let signature_status = &response.value[index];
-
-            if let Some(status) = signature_status.as_ref() {
-                // Status exists. Only `finalized` is a definitive outcome.
-                // (Case 1 above already handled finalized + success, so this
-                // is finalized + error.)
-                if status.satisfies_commitment(CommitmentConfig::finalized()) {
-                    continue;
-                }
-                // `confirmed` or `processed`: already included in a block,
-                // will finalize regardless of blockhash validity.
-                live_reason = Some(
-                    "signature is on-chain (confirmed/processed) and awaiting finalization"
-                        .to_string(),
+            // Case 3: every sig is finalized-failed or expired, safe to remint.
+            SigFinality::Dead => {
+                info!(
+                    "All withdrawal signatures for nonce {} are finalized-failed or expired; attempting remint",
+                    nonce_label
                 );
-                break;
+                execute_deferred_remint(state, &entry, storage_tx).await;
             }
-
-            // No status entry. lvbh is the only thing keeping it alive.
-            if current_height > pending_sig.last_valid_block_height {
-                continue;
-            }
-            live_reason = Some(format!(
-                "signatures still within blockhash validity (current_height={})",
-                current_height
-            ));
-            break;
         }
-
-        // Case 2: at least one broadcast could still land, defer rather than remint.
-        if let Some(reason) = live_reason {
-            defer_or_escalate(
-                &mut remaining,
-                entry,
-                &nonce_label,
-                &reason,
-                &state.storage,
-                storage_tx,
-            )
-            .await;
-            continue;
-        }
-
-        // Case 3: every sig is finalized-failed or expired, safe to remint.
-        info!(
-            "All withdrawal signatures for nonce {} are finalized-failed or expired; attempting remint",
-            nonce_label
-        );
-        execute_deferred_remint(state, &entry, storage_tx).await;
     }
 
     // `remaining` = entries not yet due + entries `defer_or_escalate` re-queued.
@@ -503,8 +477,11 @@ mod tests {
     };
     use crate::operator::utils::instruction_util::WithdrawalRemintInfo;
     use crate::operator::MintCache;
+    use crate::operator::RetryConfig;
+    use crate::operator::RpcClientWithRetry;
     use crate::storage::common::storage::mock::MockStorage;
     use crate::storage::Storage;
+    use solana_sdk::commitment_config::CommitmentConfig;
     use solana_sdk::pubkey::Pubkey;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -581,6 +558,7 @@ mod tests {
                 remint_last_valid_block_heights: None,
                 pending_remint_deadline_at: Some(now),
                 finality_check_attempts: attempts,
+                recovery_requeue_attempts: 0,
             });
     }
 
@@ -1261,6 +1239,173 @@ mod tests {
         assert!(
             state.pending_remints.is_empty(),
             "entry consumed after Completed"
+        );
+    }
+
+    // ── classify_release_signatures (multi-sig) ─────────────────
+
+    /// Bare RPC client (1 attempt, fast) for direct classifier tests.
+    fn make_rpc(url: &str) -> RpcClientWithRetry {
+        RpcClientWithRetry::with_retry_config(
+            url.to_string(),
+            RetryConfig {
+                max_attempts: 1,
+                base_delay: std::time::Duration::from_millis(1),
+                max_delay: std::time::Duration::from_millis(1),
+            },
+            CommitmentConfig::confirmed(),
+        )
+    }
+
+    /// Finalized success after an earlier finalized failure must win (full-list scan, not first-match).
+    #[tokio::test]
+    async fn classify_release_signatures_finalized_success_wins_over_earlier_failure() {
+        let mut rpc_server = mockito::Server::new_async().await;
+        let rpc = make_rpc(&rpc_server.url());
+
+        let failed = Signature::new_unique();
+        let success = Signature::new_unique();
+
+        // value[0] finalized-failed, value[1] finalized-success (positional).
+        let _status = mock_rpc(
+            &mut rpc_server,
+            "getSignatureStatuses",
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[
+                {"slot":100,"confirmations":null,"err":{"InstructionError":[0,{"Custom":1}]},"status":{"Err":{"InstructionError":[0,{"Custom":1}]}},"confirmationStatus":"finalized"},
+                {"slot":100,"confirmations":null,"err":null,"status":{"Ok":null},"confirmationStatus":"finalized"}
+            ]},"id":0}"#,
+        )
+        .await;
+
+        let sigs = vec![
+            PendingSig {
+                signature: failed,
+                last_valid_block_height: 0,
+            },
+            PendingSig {
+                signature: success,
+                last_valid_block_height: 0,
+            },
+        ];
+
+        match classify_release_signatures(&rpc, &sigs).await {
+            SigFinality::Landed(s) => assert_eq!(
+                s, success,
+                "must return the finalized-success sig, not the failed one"
+            ),
+            _ => panic!("expected Landed(success sig), got a different verdict"),
+        }
+    }
+
+    /// Confirmed success behind a finalized failure must stay Live, never Dead.
+    #[tokio::test]
+    async fn classify_release_signatures_confirmed_success_after_failure_is_live_not_dead() {
+        let mut rpc_server = mockito::Server::new_async().await;
+        let rpc = make_rpc(&rpc_server.url());
+
+        // value[0] finalized-failed, value[1] confirmed-success (in a block,
+        // will finalize).
+        let _status = mock_rpc(
+            &mut rpc_server,
+            "getSignatureStatuses",
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[
+                {"slot":100,"confirmations":null,"err":{"InstructionError":[0,{"Custom":1}]},"status":{"Err":{"InstructionError":[0,{"Custom":1}]}},"confirmationStatus":"finalized"},
+                {"slot":100,"confirmations":10,"err":null,"status":{"Ok":null},"confirmationStatus":"confirmed"}
+            ]},"id":0}"#,
+        )
+        .await;
+
+        let sigs = vec![
+            PendingSig {
+                signature: Signature::new_unique(),
+                last_valid_block_height: 0,
+            },
+            PendingSig {
+                signature: Signature::new_unique(),
+                last_valid_block_height: 0,
+            },
+        ];
+
+        assert!(
+            matches!(
+                classify_release_signatures(&rpc, &sigs).await,
+                SigFinality::Live(_)
+            ),
+            "confirmed success behind a finalized failure must be Live, not Dead"
+        );
+    }
+
+    /// A still-valid null after an expired null must be Live: nulls are walked fully, not cut at the first.
+    #[tokio::test]
+    async fn classify_release_signatures_live_null_after_expired_null_is_live() {
+        let mut rpc_server = mockito::Server::new_async().await;
+        let rpc = make_rpc(&rpc_server.url());
+
+        let _status = mock_rpc(
+            &mut rpc_server,
+            "getSignatureStatuses",
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[null,null]},"id":0}"#,
+        )
+        .await;
+        // current_height 1000: sig[0] lvbh 100 expired, sig[1] lvbh 2000 live.
+        let _height = mock_rpc(
+            &mut rpc_server,
+            "getBlockHeight",
+            r#"{"jsonrpc":"2.0","result":1000,"id":0}"#,
+        )
+        .await;
+
+        let sigs = vec![
+            PendingSig {
+                signature: Signature::new_unique(),
+                last_valid_block_height: 100,
+            },
+            PendingSig {
+                signature: Signature::new_unique(),
+                last_valid_block_height: 2000,
+            },
+        ];
+
+        assert!(
+            matches!(
+                classify_release_signatures(&rpc, &sigs).await,
+                SigFinality::Live(_)
+            ),
+            "a still-valid null after an expired null must be Live, not Dead"
+        );
+    }
+
+    /// A truncated status list (fewer statuses than sigs) must be Uncertain, never read as "missing = dead".
+    #[tokio::test]
+    async fn classify_release_signatures_status_length_mismatch_is_uncertain() {
+        let mut rpc_server = mockito::Server::new_async().await;
+        let rpc = make_rpc(&rpc_server.url());
+
+        // Two sigs requested, one status returned.
+        let _status = mock_rpc(
+            &mut rpc_server,
+            "getSignatureStatuses",
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[null]},"id":0}"#,
+        )
+        .await;
+
+        let sigs = vec![
+            PendingSig {
+                signature: Signature::new_unique(),
+                last_valid_block_height: 0,
+            },
+            PendingSig {
+                signature: Signature::new_unique(),
+                last_valid_block_height: 0,
+            },
+        ];
+
+        assert!(
+            matches!(
+                classify_release_signatures(&rpc, &sigs).await,
+                SigFinality::Uncertain(_)
+            ),
+            "length mismatch must be Uncertain"
         );
     }
 

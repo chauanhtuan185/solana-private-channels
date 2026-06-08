@@ -2,8 +2,8 @@ use crate::config::OperatorConfig;
 use crate::error::OperatorError;
 use crate::metrics;
 use crate::operator::{
-    feepayer_monitor, fetcher, processor, reconciliation, sender, DbTransactionWriter, RetryConfig,
-    RpcClientWithRetry,
+    feepayer_monitor, fetcher, processor, reconciliation, recovery, sender, DbTransactionWriter,
+    RetryConfig, RpcClientWithRetry, SignerUtil,
 };
 use crate::shutdown_utils::shutdown_operator;
 use crate::storage::Storage;
@@ -123,6 +123,7 @@ pub async fn run(
     let sender_commitment = config.rpc_commitment;
     let sender_source_rpc = source_rpc_client.clone();
     let sender_common_config = common_config.clone();
+    let recovery_storage_tx = storage_tx.clone();
     let sender_handle = tokio::spawn(async move {
         if let Err(e) = sender::run_sender(
             &sender_common_config,
@@ -173,6 +174,29 @@ pub async fn run(
         tokio::spawn(async {})
     };
 
+    // Recovery worker: resolves rows stuck in Processing after a crash.
+    let recovery_handle = {
+        let recovery_storage = storage.clone();
+        let recovery_rpc = rpc_client.clone();
+        let recovery_program_type = common_config.program_type;
+        let recovery_token = cancellation_token.clone();
+        let admin_pubkey = SignerUtil::get_admin_pubkey();
+        tokio::spawn(async move {
+            if let Err(e) = recovery::run_recovery_worker(
+                recovery_storage,
+                recovery_rpc,
+                admin_pubkey,
+                recovery_program_type,
+                recovery_storage_tx,
+                recovery_token,
+            )
+            .await
+            {
+                tracing::error!("Recovery worker error: {}", e);
+            }
+        })
+    };
+
     // Start feepayer balance monitor for escrow operators only.
     // Monitors SOL balance of the feepayer wallet used for ReleaseFunds transactions.
     let feepayer_monitor_handle =
@@ -208,8 +232,10 @@ pub async fn run(
     // A task exit increments the OPERATOR_TASK_EXIT metric with a task
     // label so dashboards can tell which one failed without tailing logs.
     //
-    // Non-critical tasks (reconciliation, feepayer monitor) are not watched
-    // here.
+    // The recovery worker is critical: if it dies, stuck-Processing rows stop
+    // being recovered, so an unexpected exit must page and restart like the
+    // pipeline stages. Non-critical tasks (reconciliation, feepayer monitor)
+    // are not watched here.
     //
     // Handles are polled by mutable reference so ownership stays here and
     // they can still be moved into `shutdown_operator` below — awaiting an
@@ -218,6 +244,7 @@ pub async fn run(
     let mut processor_handle = processor_handle;
     let mut sender_handle = sender_handle;
     let mut storage_writer_handle = storage_writer_handle;
+    let mut recovery_handle = recovery_handle;
     let pt_label = program_type.as_label();
 
     // `biased;` makes ctrl-c win on concurrent readiness — avoids a
@@ -240,6 +267,9 @@ pub async fn run(
         _ = &mut storage_writer_handle => {
             critical_exit(pt_label, "storage_writer");
         }
+        _ = &mut recovery_handle => {
+            critical_exit(pt_label, "recovery");
+        }
     }
 
     // Graceful shutdown — runs on both the ctrl-c path and the critical-task-
@@ -254,6 +284,7 @@ pub async fn run(
         storage_writer_handle,
         reconciliation_handle,
         feepayer_monitor_handle,
+        recovery_handle,
         config.batch_size,
         config.db_poll_interval,
     )
