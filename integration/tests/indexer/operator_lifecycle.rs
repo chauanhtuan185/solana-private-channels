@@ -114,8 +114,10 @@ async fn start_operator_with_alert(
     let common_config = PrivateChannelIndexerConfig {
         program_type,
         storage_type: StorageType::Postgres,
-        rpc_url,
-        source_rpc_url: None,
+        rpc_url: rpc_url.clone(),
+        // Withdraw operator requires a source chain for remints; single-validator
+        // test, so point it at the same RPC. Harmless for Escrow callers.
+        source_rpc_url: Some(rpc_url),
         postgres: postgres_config,
         escrow_instance_id: Some(instance),
     };
@@ -159,8 +161,10 @@ async fn start_operator_with_config(
     let common_config = PrivateChannelIndexerConfig {
         program_type,
         storage_type: StorageType::Postgres,
-        rpc_url,
-        source_rpc_url: None,
+        rpc_url: rpc_url.clone(),
+        // Withdraw operator requires a source chain for remints; single-validator
+        // test, so point it at the same RPC. Harmless for Escrow callers.
+        source_rpc_url: Some(rpc_url),
         postgres: postgres_config,
         escrow_instance_id: Some(instance),
     };
@@ -1204,6 +1208,7 @@ async fn test_operator_aborts_on_smt_root_mismatch_at_startup(
     // and refuses to start (returns Err); the operator task then exits.
     let operator_keypair = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
     let operator_handle = start_private_channel_to_solana_operator(
+        test_validator.rpc_url(),
         test_validator.rpc_url(),
         db_url.clone(),
         operator_keypair,
