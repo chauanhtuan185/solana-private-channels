@@ -166,6 +166,22 @@ use transaction::{
 };
 use types::{PollTaskResult, SenderState};
 
+/// Advisory-lock keys per sender role. Distinct, namespaced 64-bit values
+/// (ASCII tags, matching `TRUNCATE_ADVISORY_LOCK_ID`) so senders never collide
+/// with each other, the truncate lock, or third-party tooling that grabs
+/// small-integer advisory locks on a shared database.
+const ESCROW_SENDER_LOCK_KEY: i64 = 0x53_4E_44_5F_45_53_43_52; // "SND_ESCR"
+const WITHDRAW_SENDER_LOCK_KEY: i64 = 0x53_4E_44_5F_57_44_52_57; // "SND_WDRW"
+
+/// Advisory-lock key per operator role. Distinct keys so an escrow and a
+/// withdraw sender never contend on the same lock if they share a database.
+fn sender_lock_key(program_type: ProgramType) -> i64 {
+    match program_type {
+        ProgramType::Escrow => ESCROW_SENDER_LOCK_KEY,
+        ProgramType::Withdraw => WITHDRAW_SENDER_LOCK_KEY,
+    }
+}
+
 /// Sends transactions to the blockchain and updates their status
 ///
 /// Receives TransactionBuilder (either ReleaseFunds or Mint) from processor,
@@ -198,6 +214,23 @@ pub async fn run_sender(
         confirmation_poll_interval_ms,
         source_rpc_client,
     )?;
+
+    // Refuse to start if another sender for this role already holds the lock.
+    // Held for the rest of run_sender; released on drop or process crash. Stops
+    // two overlapping senders (e.g. a rolling restart) from both reminting the
+    // same row before either confirms on-chain.
+    let _sender_lock = match state
+        .storage
+        .try_acquire_sender_lock(sender_lock_key(config.program_type))
+        .await?
+    {
+        Some(guard) => guard,
+        None => {
+            return Err(OperatorError::SenderAlreadyRunning {
+                program_type: config.program_type,
+            });
+        }
+    };
 
     // Re-hydrate the deferred remint queue from any PendingRemint rows written
     // before a crash. These will be picked up by process_pending_remints on the
